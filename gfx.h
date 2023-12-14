@@ -44,7 +44,9 @@ enum GfxCreateContextFlag
 {
     kGfxCreateContextFlag_EnableDebugLayer       = 1 << 0,
     kGfxCreateContextFlag_EnableShaderDebugging  = 1 << 1,
-    kGfxCreateContextFlag_EnableStablePowerState = 1 << 2
+    kGfxCreateContextFlag_EnableStablePowerState = 1 << 2,
+    kGfxCreateContextFlag_EnableComputeQueue     = 1 << 3
+
 };
 typedef uint32_t GfxCreateContextFlags;
 
@@ -422,8 +424,11 @@ GfxResult gfxCommandSortRadix(GfxContext context, GfxBuffer keys_dst, GfxBuffer 
 //! Frame processing.
 //!
 
-GfxResult gfxFrame(GfxContext context, bool vsync = true);
+GfxResult gfxFrame(GfxContext context, bool vsync = false);
 GfxResult gfxFinish(GfxContext context);
+GfxResult gfxExecute(GfxContext context);
+GfxResult gfxWaitForIdle(GfxContext context);
+GfxResult gfxCommandReset(GfxContext context);
 
 //!
 //! Interop interface.
@@ -432,12 +437,13 @@ GfxResult gfxFinish(GfxContext context);
 GfxContext gfxCreateContext(ID3D12Device *device, uint32_t max_frames_in_flight = kGfxConstant_BackBufferCount);
 
 ID3D12Device *gfxGetDevice(GfxContext context);
+ID3D12CommandQueue *gfxGetQueue(GfxContext context);
 ID3D12GraphicsCommandList *gfxGetCommandList(GfxContext context);
 GfxResult gfxSetCommandList(GfxContext context, ID3D12GraphicsCommandList *command_list);
 GfxResult gfxResetCommandListState(GfxContext context); // call this function before returning to gfx after externally modifying the state on the command list
 
-GfxBuffer gfxCreateBuffer(GfxContext context, ID3D12Resource *resource, D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-GfxTexture gfxCreateTexture(GfxContext context, ID3D12Resource *resource, D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+GfxBuffer gfxCreateBuffer(GfxContext context, ID3D12Resource *resource, D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_COMMON);
+GfxTexture gfxCreateTexture(GfxContext context, ID3D12Resource *resource, D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_COMMON);
 GfxAccelerationStructure gfxCreateAccelerationStructure(GfxContext context, ID3D12Resource *resource, uint64_t byte_offset = 0);    // resource must be in D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE state
 
 ID3D12Resource *gfxBufferGetResource(GfxContext context, GfxBuffer buffer);
@@ -452,7 +458,7 @@ D3D12_RESOURCE_STATES gfxTextureGetResourceState(GfxContext context, GfxTexture 
 //!
 
 template<typename TYPE>
-GfxBuffer gfxCreateBuffer(GfxContext context, ID3D12Resource *resource, D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
+GfxBuffer gfxCreateBuffer(GfxContext context, ID3D12Resource *resource, D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_COMMON)
 {
     GfxBuffer buffer = gfxCreateBuffer(context, resource, resource_state);
     if(buffer) buffer.setStride((uint32_t)sizeof(TYPE));
@@ -500,6 +506,7 @@ class GfxInternal
     IDXGIAdapter1 *adapter_ = nullptr;
     ID3D12Device5 *dxr_device_ = nullptr;
     ID3D12CommandQueue *command_queue_ = nullptr;
+    ID3D12CommandQueue *compute_command_queue_ = nullptr;
     ID3D12GraphicsCommandList *command_list_ = nullptr;
     ID3D12GraphicsCommandList4 *dxr_command_list_ = nullptr;
     ID3D12CommandAllocator **command_allocators_ = nullptr;
@@ -1237,6 +1244,10 @@ public:
 
     GfxResult initialize(HWND window, GfxCreateContextFlags flags, IDXGIAdapter *adapter, GfxContext &context)
     {
+        // Enable shader model 6_8.
+        IID  features[] = { D3D12ExperimentalShaderModels };
+        auto hr         = D3D12EnableExperimentalFeatures( 1, features, nullptr, nullptr );
+
         if(!window)
             return GFX_SET_ERROR(kGfxResult_InvalidParameter, "An invalid window handle was supplied");
         if((flags & kGfxCreateContextFlag_EnableDebugLayer) != 0)
@@ -1361,6 +1372,16 @@ public:
         command_queue_->GetTimestampFrequency(&timestamp_query_ticks_per_second_);
         SetDebugName(command_queue_, "gfx_CommandQueue");
 
+        if( flags & kGfxCreateContextFlag_EnableComputeQueue )
+        {
+        	queue_desc      = {};
+        	queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+        	if(!SUCCEEDED(device_->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&compute_command_queue_))))
+	            return GFX_SET_ERROR(kGfxResult_InternalError, "Unable to create command queue");
+        	SetDebugName(compute_command_queue_, "gfx_ComputeCommandQueue");
+		}
+
         window_ = window;
         RECT window_rect = {};
         GetClientRect(window_, &window_rect);
@@ -1385,16 +1406,20 @@ public:
             return GFX_SET_ERROR(kGfxResult_InternalError, "Unable to initialize swap chain");
         fence_index_ = swap_chain_->GetCurrentBackBufferIndex();
 
+		auto commandListType = ( flags & kGfxCreateContextFlag_EnableComputeQueue )
+        	? D3D12_COMMAND_LIST_TYPE_COMPUTE
+        	: D3D12_COMMAND_LIST_TYPE_DIRECT;
+
         command_allocators_ = (ID3D12CommandAllocator **)malloc(max_frames_in_flight_ * sizeof(ID3D12CommandAllocator *));
         for(uint32_t j = 0; j < max_frames_in_flight_; ++j)
         {
             char buffer[256];
             GFX_SNPRINTF(buffer, sizeof(buffer), "gfx_CommandAllocator%u", j);
-            if(!SUCCEEDED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&command_allocators_[j]))))
+            if(!SUCCEEDED(device_->CreateCommandAllocator(commandListType, IID_PPV_ARGS(&command_allocators_[j]))))
                 return GFX_SET_ERROR(kGfxResult_InternalError, "Unable to create command allocator");
             SetDebugName(command_allocators_[j], buffer);
         }
-        if(!SUCCEEDED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, *command_allocators_, nullptr, IID_PPV_ARGS(&command_list_))))
+        if(!SUCCEEDED(device_->CreateCommandList(0, commandListType, *command_allocators_, nullptr, IID_PPV_ARGS(&command_list_))))
             return GFX_SET_ERROR(kGfxResult_InternalError, "Unable to create command list");
         command_list_->QueryInterface(IID_PPV_ARGS(&dxr_command_list_));
         if(dxr_command_list_ == nullptr) { if(dxr_device_ != nullptr) dxr_device_->Release(); dxr_device_ = nullptr; }
@@ -1418,15 +1443,18 @@ public:
         back_buffers_ = (ID3D12Resource **)malloc(max_frames_in_flight_ * sizeof(ID3D12Resource *));
         back_buffer_rtvs_ = (uint32_t *)malloc(max_frames_in_flight_ * sizeof(uint32_t));
         GFX_TRY(acquireSwapChainBuffers());
-
-        D3D12_RESOURCE_BARRIER resource_barrier = {};
-        resource_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        resource_barrier.Transition.pResource = back_buffers_[fence_index_];
-        resource_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-        resource_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        resource_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        command_list_->ResourceBarrier(1, &resource_barrier);
-
+        
+        if( !( flags & kGfxCreateContextFlag_EnableComputeQueue ) )
+        {
+	        D3D12_RESOURCE_BARRIER resource_barrier = {};
+	        resource_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	        resource_barrier.Transition.pResource = back_buffers_[fence_index_];
+	        resource_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+	        resource_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	        resource_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	        command_list_->ResourceBarrier(1, &resource_barrier);
+    	}
+    	
         return initializeCommon(context);
     }
 
@@ -1658,6 +1686,8 @@ public:
             dxr_device_->Release();
         if(command_queue_ != nullptr)
             command_queue_->Release();
+        if(compute_command_queue_ != nullptr)
+            compute_command_queue_->Release();    
         if(command_list_ != nullptr)
             command_list_->Release();
         if(dxr_command_list_ != nullptr)
@@ -4148,9 +4178,54 @@ public:
             return GFX_SET_ERROR(kGfxResult_InvalidOperation, "Cannot synchronize commands when using an interop context");
         command_list_->Close(); // close command list for submit
         ID3D12CommandList *const command_lists[] = { command_list_ };
-        command_queue_->ExecuteCommandLists(ARRAYSIZE(command_lists), command_lists);
+        
+        if( compute_command_queue_ )
+        {
+            compute_command_queue_->ExecuteCommandLists(ARRAYSIZE(command_lists), command_lists);
+        }
+        else
+        {
+            command_queue_->ExecuteCommandLists(ARRAYSIZE(command_lists), command_lists);
+        }
+        
+        
         GFX_TRY(sync());    // make sure GPU has gone through all pending work
         command_allocators_[fence_index_]->Reset();
+        command_list_->Reset(command_allocators_[fence_index_], nullptr);
+        resetState();   // re-install state
+        return kGfxResult_NoError;
+    }
+
+    GfxResult execute()
+    {
+        if(isInterop())
+            return GFX_SET_ERROR(kGfxResult_InvalidOperation, "Cannot synchronize commands when using an interop context");
+        command_list_->Close(); // close command list for submit
+        ID3D12CommandList *const command_lists[] = { command_list_ };
+        
+        if( compute_command_queue_ )
+        {
+            compute_command_queue_->ExecuteCommandLists(ARRAYSIZE(command_lists), command_lists);
+        }
+        else
+        {
+            command_queue_->ExecuteCommandLists(ARRAYSIZE(command_lists), command_lists);
+        }
+
+        return kGfxResult_NoError;
+    }
+
+    GfxResult waitForIdle()
+    {
+        GFX_TRY(sync());    // make sure GPU has gone through all pending work
+        command_allocators_[fence_index_]->Reset();
+        command_list_->Reset(command_allocators_[fence_index_], nullptr);
+        resetState();   // re-install state
+        return kGfxResult_NoError;
+    }
+
+    GfxResult commandReset()
+    {
         command_list_->Reset(command_allocators_[fence_index_], nullptr);
         resetState();   // re-install state
         return kGfxResult_NoError;
@@ -4164,6 +4239,13 @@ public:
     ID3D12GraphicsCommandList *getCommandList() const
     {
         return command_list_;
+    }
+
+    ID3D12CommandQueue *getCommandQueue() const
+    {
+        return compute_command_queue_ != nullptr
+            ? compute_command_queue_
+            : command_queue_;
     }
 
     GfxResult setCommandList(ID3D12GraphicsCommandList *command_list)
@@ -6921,7 +7003,7 @@ private:
                         Buffer &gfx_buffer = buffers_[buffer];
                         SetObjectName(gfx_buffer, buffer.name);
                         if(buffer.cpu_access == kGfxCpuAccess_None)
-                            transitionResource(gfx_buffer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                            transitionResource(gfx_buffer, D3D12_RESOURCE_STATE_COMMON);
                         if(!invalidate_descriptor) continue;    // already up to date
                         if(buffer.stride != GFX_ALIGN(buffer.stride, 4))
                             GFX_PRINTLN("Warning: Encountered a buffer stride of %u that isn't 4-byte aligned for parameter `%s' of program `%s/%s'; is this intentional?", buffer.stride, parameter.parameter_->name_.c_str(), program.file_path_.c_str(), program.file_name_.c_str());
@@ -7049,7 +7131,7 @@ private:
                             device_->CreateShaderResourceView(nullptr, &dummy_srv_desc, descriptors_.getCPUHandle(parameter.descriptor_slot_ + j));
                             continue;   // out of bounds mip level
                         }
-                        transitionResource(gfx_texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        transitionResource(gfx_texture, D3D12_RESOURCE_STATE_COMMON);
                         if(!invalidate_descriptor && gfx_texture.resource_ == parameter.bound_textures_[j])
                             continue;    // already up to date
                         D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
@@ -7172,7 +7254,7 @@ private:
                             device_->CreateShaderResourceView(nullptr, &dummy_srv_desc, descriptors_.getCPUHandle(parameter.descriptor_slot_ + j));
                             continue;   // out of bounds mip level
                         }
-                        transitionResource(gfx_texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        transitionResource(gfx_texture, D3D12_RESOURCE_STATE_COMMON);
                         if(!invalidate_descriptor && gfx_texture.resource_ == parameter.bound_textures_[j])
                             continue;    // already up to date
                         D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
@@ -7297,7 +7379,7 @@ private:
                             device_->CreateShaderResourceView(nullptr, &dummy_srv_desc, descriptors_.getCPUHandle(parameter.descriptor_slot_ + j));
                             continue;   // out of bounds mip level
                         }
-                        transitionResource(gfx_texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        transitionResource(gfx_texture, D3D12_RESOURCE_STATE_COMMON);
                         if(!invalidate_descriptor && gfx_texture.resource_ == parameter.bound_textures_[j])
                             continue;    // already up to date
                         D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
@@ -7421,7 +7503,7 @@ private:
                             device_->CreateShaderResourceView(nullptr, &dummy_srv_desc, descriptors_.getCPUHandle(parameter.descriptor_slot_ + j));
                             continue;   // out of bounds mip level
                         }
-                        transitionResource(gfx_texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        transitionResource(gfx_texture, D3D12_RESOURCE_STATE_COMMON);
                         if(!invalidate_descriptor && gfx_texture.resource_ == parameter.bound_textures_[j])
                             continue;    // already up to date
                         D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
@@ -7870,6 +7952,7 @@ private:
         shader_args.push_back(L"-I"); shader_args.push_back(L".");
         shader_args.push_back(L"-T"); shader_args.push_back(wshader_profile);
         shader_args.push_back(L"-HV 2021");
+        shader_args.push_back(L"-Vd");
 
         std::vector<std::wstring> exports;
         if(shader_type == kShaderType_LIB)
@@ -8158,7 +8241,15 @@ private:
     {
         for(uint32_t i = 0; i < max_frames_in_flight_; ++i)
         {
-            command_queue_->Signal(fences_[i], ++fence_values_[i]);
+        	if( compute_command_queue_)
+        	{
+            	compute_command_queue_->Signal(fences_[i], ++fence_values_[i]);
+            }
+            else
+            {
+				command_queue_->Signal(fences_[i], ++fence_values_[i]);
+            }
+            
             if(fences_[i]->GetCompletedValue() < fence_values_[i])
             {
                 fences_[i]->SetEventOnCompletion(fence_values_[i], fence_event_);
@@ -9035,11 +9126,32 @@ GfxResult gfxFrame(GfxContext context, bool vsync)
     return gfx->frame(vsync);
 }
 
+GfxResult gfxExecute( GfxContext context )
+{
+    GfxInternal *gfx = GfxInternal::GetGfx(context);
+    if(!gfx) return kGfxResult_InvalidParameter;
+    return gfx->execute();
+}
+
+GfxResult gfxWaitForIdle( GfxContext context )
+{
+    GfxInternal *gfx = GfxInternal::GetGfx(context);
+    if(!gfx) return kGfxResult_InvalidParameter;
+    return gfx->waitForIdle();
+}
+
 GfxResult gfxFinish(GfxContext context)
 {
     GfxInternal *gfx = GfxInternal::GetGfx(context);
     if(!gfx) return kGfxResult_InvalidParameter;
     return gfx->finish();
+}
+
+GfxResult gfxCommandReset( GfxContext context )
+{
+    GfxInternal *gfx = GfxInternal::GetGfx(context);
+    if(!gfx) return kGfxResult_InvalidParameter;
+    return gfx->commandReset();
 }
 
 GfxContext gfxCreateContext(ID3D12Device *device, uint32_t max_frames_in_flight)
@@ -9072,6 +9184,14 @@ ID3D12GraphicsCommandList *gfxGetCommandList(GfxContext context)
     if(!gfx) return nullptr;    // invalid context
     return gfx->getCommandList();
 }
+
+ID3D12CommandQueue *gfxGetQueue(GfxContext context)
+{
+    GfxInternal *gfx = GfxInternal::GetGfx(context);
+    if(!gfx) return nullptr;    // invalid context
+    return gfx->getCommandQueue();
+}
+
 
 GfxResult gfxSetCommandList(GfxContext context, ID3D12GraphicsCommandList *command_list)
 {

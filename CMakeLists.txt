@@ -50,16 +50,18 @@ target_compile_options(gfx PRIVATE
     -D_HAS_EXCEPTIONS=0
 )
 
-add_library(dxcompiler SHARED IMPORTED)
-set_target_properties(dxcompiler PROPERTIES
-    IMPORTED_LOCATION ${GFX_DXC_PATH}/bin/x64/dxcompiler.dll
-    IMPORTED_IMPLIB ${GFX_DXC_PATH}/lib/x64/dxcompiler.lib
-)
-add_library(dxil SHARED IMPORTED)
-set_target_properties(dxil PROPERTIES
-    IMPORTED_LOCATION ${GFX_DXC_PATH}/bin/x64/dxil.dll
-    IMPORTED_IMPLIB ${GFX_DXC_PATH}/lib/x64/dxcompiler.lib
-)
+#Do not replace custom DX binaries
+#add_library(dxcompiler SHARED IMPORTED)
+#set_target_properties(dxcompiler PROPERTIES
+#    IMPORTED_LOCATION ${GFX_DXC_PATH}/bin/x64/dxcompiler.dll
+#    IMPORTED_IMPLIB ${GFX_DXC_PATH}/lib/x64/dxcompiler.lib
+#)
+
+#add_library(dxil SHARED IMPORTED)
+#set_target_properties(dxil PROPERTIES
+#    IMPORTED_LOCATION ${GFX_DXC_PATH}/bin/x64/dxil.dll
+#    IMPORTED_IMPLIB ${GFX_DXC_PATH}/lib/x64/dxcompiler.lib
+#)
 
 add_library(WinPixEventRuntime SHARED IMPORTED)
 set_target_properties(WinPixEventRuntime PROPERTIES
@@ -67,7 +69,7 @@ set_target_properties(WinPixEventRuntime PROPERTIES
     IMPORTED_IMPLIB ${GFX_PIX_PATH}/bin/x64/WinPixEventRuntime.lib
 )
 
-target_link_libraries(gfx PUBLIC d3d12.lib dxgi.lib glm tinyobjloader ktx dxcompiler dxil WinPixEventRuntime)
+target_link_libraries(gfx PUBLIC d3d12.lib dxgi.lib glm tinyobjloader ktx dxcompiler WinPixEventRuntime)
 
 if(GFX_BUILD_EXAMPLES)
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/examples)
